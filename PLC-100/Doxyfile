@@ -1,0 +1,22 @@
+PROJECT_NAME           = "XIAO ESP32-C6 Zigbee End Device"
+PROJECT_BRIEF          = "Modular Zigbee End Device for Zigbee2MQTT & Home Assistant"
+
+OUTPUT_DIRECTORY       = docs/doxygen
+INPUT                  = src include
+FILE_PATTERNS          = *.cpp *.h
+RECURSIVE              = YES
+
+EXTRACT_ALL            = YES
+EXTRACT_PRIVATE        = YES
+EXTRACT_STATIC         = YES
+
+GENERATE_HTML          = YES
+GENERATE_LATEX         = NO
+MARKDOWN_SUPPORT       = YES
+
+OPTIMIZE_OUTPUT_FOR_C  = NO
+OPTIMIZE_OUTPUT_JAVA   = NO
+
+QUIET                  = YES
+WARNINGS               = YES
+

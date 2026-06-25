@@ -1,6 +1,9 @@
 # PLC-100
 library repository for PLC-100 Esp32-C6
 
+<img src="\pictures\PLC-100.png" height="400">
+
+
 ## Abilitazione Seriale su Platformio
 board_build.usb_cdc = 1
 board_build.hwids = [["0x303A", "0x1001"]]
