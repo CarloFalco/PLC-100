@@ -1,0 +1,72 @@
+# =============================================================================
+# Automazioni Home Assistant per il watchdog della scheda PLC (ESP32-C6)
+#
+# PRIMA DI USARLE sostituisci i tre entity_id con quelli reali:
+#   switch.plc_heartbeat  -> endpoint 31 (WD-Heartbeat)
+#   switch.plc_wd_status  -> endpoint 32 (WD-Status)
+#   switch.plc_wd_enable  -> endpoint 33 (WD-Enable)   [non usato qui: lo
+#                            commuti a mano dalla dashboard per passare da
+#                            modalita' ombra (OFF) a riavvii reali (ON)]
+# Se le entita' sono di dominio "light" invece di "switch" non cambia nulla:
+# i servizi usati sono quelli generici "homeassistant.*".
+#
+# Sostituisci anche notify.notify con il tuo servizio, es.
+#   notify.mobile_app_<nome_telefono>
+# =============================================================================
+
+# 1. Heartbeat: commuta l'endpoint ogni minuto (serve che il valore CAMBI a
+#    ogni invio, per questo toggle e non turn_on).
+- id: plc_heartbeat
+  alias: "PLC - heartbeat"
+  mode: single
+  triggers:
+    - trigger: time_pattern
+      minutes: "/1"
+  conditions:
+    - condition: not
+      conditions:
+        - condition: state
+          entity_id: switch.plc_heartbeat
+          state:
+            - unavailable
+            - unknown
+  actions:
+    - action: homeassistant.toggle
+      target:
+        entity_id: switch.plc_heartbeat
+
+# 2. Il watchdog e' scattato (o ha riavviato la scheda): notifica e conferma
+#    riportando WD-Status a OFF (la scheda cancella il suo flag).
+- id: plc_watchdog_scattato
+  alias: "PLC - watchdog scattato"
+  mode: single
+  triggers:
+    - trigger: state
+      entity_id: switch.plc_wd_status
+      to: "on"
+  actions:
+    - action: notify.notify
+      data:
+        title: "Scheda PLC"
+        message: >
+          Il watchdog della scheda PLC e' scattato: nessun segnale di vita o
+          rete assente. Se la modalita' ombra e' attiva e' solo una
+          segnalazione, altrimenti la scheda si e' riavviata.
+    - action: homeassistant.turn_off
+      target:
+        entity_id: switch.plc_wd_status
+
+# 3. Rete di sicurezza: scheda non disponibile da piu' di 15 minuti.
+- id: plc_non_disponibile
+  alias: "PLC - scheda non disponibile"
+  mode: single
+  triggers:
+    - trigger: state
+      entity_id: switch.plc_heartbeat
+      to: unavailable
+      for: "00:15:00"
+  actions:
+    - action: notify.notify
+      data:
+        title: "Scheda PLC"
+        message: "La scheda PLC non e' disponibile da oltre 15 minuti."

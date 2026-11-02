@@ -1,8 +1,11 @@
 // =============================================================================
-// ESP32-PLC 100 (ESP32-C6) – Zigbee End Device
+// ESP32-PLC 100 (ESP32-C6) – Zigbee Router
 // Rele    : EP 1–6   → ZigbeeLight (on/off da zigbee2mqtt)
 // DIN 1–4 : EP 11–14 → ZigbeeLight (sola lettura, stato imposto dal poll)
 // AIN 1–4 : EP 21–24 → ZigbeeLight (sola lettura, soglia 5 V)
+// Watchdog: EP 31 Heartbeat (HA lo commuta ogni minuto)
+//           EP 32 WD-Status (ON = watchdog scattato, HA lo riporta a OFF)
+//           EP 33 WD-Enable (OFF = modalita' ombra, ON = riavvii reali)
 //
 // Prerequisiti Arduino IDE:
 //   Board           : esp32 by Espressif >= 3.x
@@ -18,6 +21,8 @@
 #include "Zigbee.h"
 #include <Wire.h>
 #include <RTClib.h>
+#include <Preferences.h>
+#include <esp_system.h>
 
 // ---------------------------------------------------------------------------
 // PCA9557 – expander I2C per i rele
@@ -120,6 +125,54 @@ ZigbeeLight zbAin4(24);
 // ---------------------------------------------------------------------------
 PCA9557    io(GPIO_EXPANDER_ADDR, &Wire);
 RTC_DS3231 rtc;
+bool       g_rtcOk = false;
+
+// ---------------------------------------------------------------------------
+// Watchdog di rete (heartbeat da Home Assistant)
+//
+//  - HA commuta l'endpoint Heartbeat (EP 31) ogni minuto. Qualunque comando
+//    ricevuto (heartbeat o rele') vale come "segnale di vita".
+//  - Il controllo si ARMA solo al primo heartbeat ricevuto (salvato in NVS):
+//    finche' HA non e' configurato la scheda non si riavvia per mancanza di
+//    heartbeat.
+//  - Scatta se: (armato e nessun segnale da troppo tempo) oppure
+//    (non connessa alla rete da troppo tempo).
+//  - Timeout crescenti: 15, 30, 60 min, poi un solo tentativo ogni 6 ore.
+//    Il contatore sta in NVS e si azzera al primo segnale di vita.
+//  - MODALITA' OMBRA (default): invece di riavviare accende WD-Status
+//    (EP 32). I riavvii reali si abilitano da HA con WD-Enable (EP 33),
+//    senza ricompilare.
+// ---------------------------------------------------------------------------
+#define WD_LEVEL1_MS  (15UL * 60UL * 1000UL)
+#define WD_LEVEL2_MS  (30UL * 60UL * 1000UL)
+#define WD_LEVEL3_MS  (60UL * 60UL * 1000UL)
+#define WD_LONG_MS    (6UL * 60UL * 60UL * 1000UL)
+#define WD_TIME_DIV   1    // prove al banco: 60 => i minuti diventano secondi
+
+ZigbeeLight zbHeartbeat(31);
+ZigbeeLight zbWdStatus(32);
+ZigbeeLight zbWdEnable(33);
+
+Preferences prefs;
+
+// Stato persistente (NVS, namespace "plcwd")
+bool    g_armed        = false;
+bool    g_wdEnabled    = false;   // false = modalita' ombra
+uint8_t g_restartCount = 0;
+bool    g_wdFlag       = false;   // evento non ancora confermato da HA
+
+// Stato runtime (i flag volatile arrivano dai callback del task Zigbee)
+volatile uint32_t g_lastLifeMs  = 0;
+volatile bool     g_lifePending = false;
+volatile bool     g_hbPending   = false;
+volatile bool     g_enPending   = false;
+volatile bool     g_enTarget    = false;
+volatile bool     g_ackPending  = false;
+uint32_t g_lastConnectedMs = 0;
+bool     g_wasConnected    = false;
+bool     g_shadowFired     = false;
+
+inline void lifeSignal() { g_lastLifeMs = millis(); g_lifePending = true; }
 
 // ---------------------------------------------------------------------------
 // Pending relay (thread-safe: i callback Zigbee arrivano da altro task RTOS)
@@ -132,12 +185,17 @@ void writeRelay(uint8_t relay, bool state) {
   io.digitalWrite(relay, state ? HIGH : LOW);
 }
 
-void onRelay1Change(bool s) { g_relayTarget[1]=s; g_relayPending[1]=true; }
-void onRelay2Change(bool s) { g_relayTarget[2]=s; g_relayPending[2]=true; }
-void onRelay3Change(bool s) { g_relayTarget[3]=s; g_relayPending[3]=true; }
-void onRelay4Change(bool s) { g_relayTarget[4]=s; g_relayPending[4]=true; }
-void onRelay5Change(bool s) { g_relayTarget[5]=s; g_relayPending[5]=true; }
-void onRelay6Change(bool s) { g_relayTarget[6]=s; g_relayPending[6]=true; }
+void onRelay1Change(bool s) { g_relayTarget[1]=s; g_relayPending[1]=true; lifeSignal(); }
+void onRelay2Change(bool s) { g_relayTarget[2]=s; g_relayPending[2]=true; lifeSignal(); }
+void onRelay3Change(bool s) { g_relayTarget[3]=s; g_relayPending[3]=true; lifeSignal(); }
+void onRelay4Change(bool s) { g_relayTarget[4]=s; g_relayPending[4]=true; lifeSignal(); }
+void onRelay5Change(bool s) { g_relayTarget[5]=s; g_relayPending[5]=true; lifeSignal(); }
+void onRelay6Change(bool s) { g_relayTarget[6]=s; g_relayPending[6]=true; lifeSignal(); }
+
+// Callback watchdog (chiamati dal task Zigbee: solo flag, niente NVS/I2C qui)
+void onHeartbeat(bool)        { g_hbPending = true; lifeSignal(); }
+void onWdStatusChange(bool s) { if (!s) g_ackPending = true; }      // HA conferma -> OFF
+void onWdEnableChange(bool s) { g_enTarget = s; g_enPending = true; }
 
 // Callback vuoti per gli endpoint di ingresso:
 // z2m potrebbe inviare comandi, li ignoriamo (il poll sovrascrive lo stato)
@@ -157,17 +215,141 @@ bool analogThreshold(bool prev, int realMv) {
 }
 
 // ---------------------------------------------------------------------------
+// Factory reset Zigbee: tieni premuto BOOT per piu' di 3 s.
+// Chiamata sia nel loop sia durante l'attesa della rete in setup, cosi' si
+// puo' fare il reset anche quando la scheda non riesce a connettersi.
+// ---------------------------------------------------------------------------
+void checkFactoryReset() {
+  if (digitalRead(BOOT_PIN) != LOW) return;
+  delay(100);
+  uint32_t t0 = millis();
+  while (digitalRead(BOOT_PIN) == LOW) {
+    delay(50);
+    if ((millis() - t0) > 3000) {
+      Serial.println("[INFO] Factory reset Zigbee...");
+      delay(500);
+      Zigbee.factoryReset();
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Watchdog: funzioni
+// ---------------------------------------------------------------------------
+uint32_t wdTimeoutMs() {
+  uint32_t ms;
+  switch (g_restartCount) {
+    case 0:  ms = WD_LEVEL1_MS; break;
+    case 1:  ms = WD_LEVEL2_MS; break;
+    case 2:  ms = WD_LEVEL3_MS; break;
+    default: ms = WD_LONG_MS;   break;
+  }
+  return ms / WD_TIME_DIV;
+}
+
+void setWdFlag(bool v) {
+  g_wdFlag = v;
+  prefs.putBool("flag", v);
+  zbWdStatus.setLight(v);
+}
+
+// Da chiamare spesso (loop e attesa connessione in setup)
+void wdService() {
+  // 1. Eventi arrivati dai callback, gestiti qui fuori dal task Zigbee
+  if (g_lifePending) {
+    g_lifePending = false;
+    g_shadowFired = false;
+    if (g_restartCount != 0) {           // scrive in NVS solo se serve
+      g_restartCount = 0;
+      prefs.putUChar("rcnt", 0);
+      Serial.println("[WD] segnale di vita: contatore riavvii azzerato");
+    }
+  }
+  if (g_hbPending) {
+    g_hbPending = false;
+    if (!g_armed) {
+      g_armed = true;
+      prefs.putBool("armed", true);
+      Serial.println("[WD] ARMATO (primo heartbeat ricevuto)");
+    }
+  }
+  if (g_enPending) {
+    g_enPending = false;
+    bool t = g_enTarget;
+    if (t != g_wdEnabled) {
+      g_wdEnabled = t;
+      prefs.putBool("en", t);
+      Serial.printf("[WD] riavvii reali %s\n", t ? "ABILITATI" : "disabilitati (modalita' ombra)");
+    }
+  }
+  if (g_ackPending) {
+    g_ackPending = false;
+    if (g_wdFlag) { g_wdFlag = false; prefs.putBool("flag", false); }
+  }
+
+  // 2. Stato di rete
+  bool connected = Zigbee.connected();
+  uint32_t life  = g_lastLifeMs;         // letto PRIMA di millis(): niente sottrazioni negative
+  uint32_t now   = millis();
+  if (connected) {
+    g_lastConnectedMs = now;
+    if (!g_wasConnected) {               // (ri)connessione: ripubblica lo stato
+      zbWdEnable.setLight(g_wdEnabled);
+      zbWdStatus.setLight(g_wdFlag);
+    }
+  }
+  g_wasConnected = connected;
+
+  // 3. Condizioni di scatto
+  uint32_t to = wdTimeoutMs();
+  bool noLife = g_armed && (now - life > to);
+  bool noNet  = (now - g_lastConnectedMs > to);
+  if (!noLife && !noNet) return;
+
+  const char *why = noNet ? "rete assente" : "heartbeat assente";
+
+  if (!g_wdEnabled) {                    // MODALITA' OMBRA: segnala e basta
+    if (!g_shadowFired) {
+      g_shadowFired = true;
+      Serial.printf("[WD] (ombra) sarebbe scattato: %s da oltre %lu s\n", why, (unsigned long)(to / 1000UL));
+      setWdFlag(true);
+    }
+    return;
+  }
+
+  // RIAVVIO REALE (con backoff: il contatore sale a ogni riavvio)
+  if (g_restartCount < 250) g_restartCount++;
+  prefs.putUChar("rcnt", g_restartCount);
+  prefs.putBool("flag", true);
+  Serial.printf("[WD] RIAVVIO #%u: %s\n", (unsigned)g_restartCount, why);
+  Serial.flush();
+  delay(300);
+  ESP.restart();
+}
+
+// ---------------------------------------------------------------------------
 // setup()
 // ---------------------------------------------------------------------------
 void setup() {
   Serial.begin(115200);
   Serial.println("\n=== ESP32-PLC Zigbee ===");
 
+  // Watchdog: stato persistente
+  prefs.begin("plcwd", false);
+  g_armed        = prefs.getBool("armed", false);
+  g_wdEnabled    = prefs.getBool("en", false);      // default: modalita' ombra
+  g_restartCount = prefs.getUChar("rcnt", 0);
+  g_wdFlag       = prefs.getBool("flag", false);
+  // motivo reset: 1=power-on 3=riavvio sw 4=panic 5/6/7=watchdog 9=brownout
+  Serial.printf("[BOOT] motivo_reset=%d armato=%d riavvii_reali=%d contatore=%u\n",
+                (int)esp_reset_reason(), g_armed, g_wdEnabled, (unsigned)g_restartCount);
+
   Wire.begin(SDA_PIN, SCL_PIN);
   io.write_register(0x03, 0b10000001);  // bit1-6 output (rele)
   io.write_register(0x01, 0b00000000);  // tutti i rele OFF
 
-  if (!rtc.begin()) {
+  g_rtcOk = rtc.begin();                  // una sola volta: non va richiamato nel loop
+  if (!g_rtcOk) {
     Serial.println("[WARN] RTC non trovato");
   } else if (rtc.lostPower()) {
     rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
@@ -199,6 +381,11 @@ void setup() {
   zbAin3.setManufacturerAndModel("ESP32-PLC", "AIN-3"); zbAin3.onLightChange(onAinChange); Zigbee.addEndpoint(&zbAin3);
   zbAin4.setManufacturerAndModel("ESP32-PLC", "AIN-4"); zbAin4.onLightChange(onAinChange); Zigbee.addEndpoint(&zbAin4);
 
+  // -- Watchdog (heartbeat / stato / abilitazione) --
+  zbHeartbeat.setManufacturerAndModel("ESP32-PLC", "WD-Heartbeat"); zbHeartbeat.onLightChange(onHeartbeat);       Zigbee.addEndpoint(&zbHeartbeat);
+  zbWdStatus.setManufacturerAndModel("ESP32-PLC", "WD-Status");     zbWdStatus.onLightChange(onWdStatusChange);   Zigbee.addEndpoint(&zbWdStatus);
+  zbWdEnable.setManufacturerAndModel("ESP32-PLC", "WD-Enable");     zbWdEnable.onLightChange(onWdEnableChange);   Zigbee.addEndpoint(&zbWdEnable);
+
   // -- Zigbee stack --
   Serial.println("[INFO] Avvio Zigbee stack...");
   if (!Zigbee.begin(ZIGBEE_ROUTER)) {
@@ -208,17 +395,17 @@ void setup() {
   }
 
   Serial.print("[INFO] Connessione alla rete Zigbee");
-  uint32_t t0 = millis();
+  g_lastConnectedMs = millis();
+  g_lastLifeMs      = millis();
   while (!Zigbee.connected()) {
     Serial.print(".");
     delay(200);
-    if (millis() - t0 > 30000) {
-      Serial.println("\n[WARN] Timeout - reboot");
-      delay(500);
-      ESP.restart();
-    }
+    checkFactoryReset();   // BOOT > 3 s: reset Zigbee anche se non si connette
+    wdService();           // riavvia (con backoff) solo se i riavvii reali sono abilitati
   }
   Serial.println("\n[INFO] Connesso!");
+  g_lastConnectedMs = millis();
+  g_lastLifeMs      = millis();
 }
 
 // ---------------------------------------------------------------------------
@@ -275,25 +462,17 @@ void loop() {
   }
 
   // 3. Factory reset BOOT > 3s
-  if (digitalRead(BOOT_PIN) == LOW) {
-    delay(100);
-    uint32_t t0 = millis();
-    while (digitalRead(BOOT_PIN) == LOW) {
-      delay(50);
-      if ((millis() - t0) > 3000) {
-        Serial.println("[INFO] Factory reset Zigbee...");
-        delay(500);
-        Zigbee.factoryReset();
-      }
-    }
-  }
+  checkFactoryReset();
 
-  // 4. Debug ogni 5s
+  // 4. Watchdog di rete
+  wdService();
+
+  // 5. Debug ogni 5s
   static uint32_t lastDbg = 0;
   if (millis() - lastDbg >= 5000) {
     lastDbg = millis();
     char ts[24] = "RTC-ERR";
-    if (rtc.begin()) {
+    if (g_rtcOk) {
       DateTime now = rtc.now();
       snprintf(ts, sizeof(ts), "%04d-%02d-%02d %02d:%02d:%02d",
                now.year(), now.month(), now.day(),
@@ -305,5 +484,8 @@ void loop() {
       (int)g_relayTarget[1],(int)g_relayTarget[2],
       (int)g_relayTarget[3],(int)g_relayTarget[4],
       (int)g_relayTarget[5],(int)g_relayTarget[6]);
+    Serial.printf("[WD] armato=%d riavvii_reali=%d contatore=%u ultimo_segnale=%lus fa\n",
+      g_armed, g_wdEnabled, (unsigned)g_restartCount,
+      (unsigned long)((millis() - g_lastLifeMs) / 1000UL));
   }
 }
