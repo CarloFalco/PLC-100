@@ -172,7 +172,9 @@ uint32_t g_lastConnectedMs = 0;
 bool     g_wasConnected    = false;
 bool     g_shadowFired     = false;
 
-inline void lifeSignal() { g_lastLifeMs = millis(); g_lifePending = true; }
+volatile uint32_t g_rxCount = 0;   // comandi ricevuti da Zigbee (diagnostica)
+
+inline void lifeSignal() { g_lastLifeMs = millis(); g_rxCount = g_rxCount + 1; g_lifePending = true; }
 
 // ---------------------------------------------------------------------------
 // Pending relay (thread-safe: i callback Zigbee arrivano da altro task RTOS)
@@ -180,9 +182,54 @@ inline void lifeSignal() { g_lastLifeMs = millis(); g_lifePending = true; }
 volatile bool g_relayPending[7] = {};
 volatile bool g_relayTarget[7]  = {};
 
-void writeRelay(uint8_t relay, bool state) {
-  if (relay < 1 || relay > 6) return;
-  io.digitalWrite(relay, state ? HIGH : LOW);
+// ---------------------------------------------------------------------------
+// Uscite rele' tramite espansore I2C (PCA9557), scrittura "a prova di glitch"
+//
+// Se l'espansore subisce un disturbo (rele' che commutano, brownout) puo'
+// perdere la configurazione e tornare con tutti i pin in ingresso: i rele'
+// smettono di rispondere mentre il resto della scheda (Zigbee compreso)
+// continua a funzionare. Per questo:
+//  - lo stato desiderato dei 6 rele' viene riscritto per intero ogni
+//    RELAY_REFRESH_MS, insieme alla configurazione dei pin;
+//  - prima della riscrittura periodica si legge la configurazione: se e'
+//    cambiata lo segnala sul seriale (contatore expReset);
+//  - dopo 3 scritture consecutive fallite si prova a liberare il bus I2C.
+// ---------------------------------------------------------------------------
+#define PCA_CONFIG_VALUE  0b10000001   // bit0 e bit7 ingressi, bit1..6 uscite (rele')
+#define RELAY_REFRESH_MS  2000
+
+uint32_t g_i2cErrTotal   = 0;
+uint32_t g_expResetTotal = 0;
+uint8_t  g_i2cErrRun     = 0;
+
+void i2cRecover() {
+  Serial.println("[I2C] scritture fallite di seguito: recupero del bus");
+  Wire.end();
+  pinMode(SDA_PIN, INPUT_PULLUP);
+  pinMode(SCL_PIN, OUTPUT);
+  for (int i = 0; i < 9; i++) {          // 9 impulsi di clock sbloccano uno slave bloccato
+    digitalWrite(SCL_PIN, LOW);  delayMicroseconds(10);
+    digitalWrite(SCL_PIN, HIGH); delayMicroseconds(10);
+  }
+  Wire.begin(SDA_PIN, SCL_PIN);
+}
+
+bool applyRelayOutputs(bool verifyConfig) {
+  if (verifyConfig) {
+    uint8_t cfg = 0;
+    if (io.read_register(0x03, &cfg) && cfg != PCA_CONFIG_VALUE) {
+      g_expResetTotal++;
+      Serial.printf("[I2C] configurazione espansore cambiata (0x%02X): riconfiguro\n", cfg);
+    }
+  }
+  uint8_t mask = 0;
+  for (uint8_t i = 1; i <= 6; i++) {
+    if (g_relayTarget[i]) mask |= (1 << i);
+  }
+  // prima il valore delle uscite, poi la direzione dei pin: niente impulsi sui rele'
+  bool ok = io.write_register(0x01, mask);
+  ok = io.write_register(0x03, PCA_CONFIG_VALUE) && ok;
+  return ok;
 }
 
 void onRelay1Change(bool s) { g_relayTarget[1]=s; g_relayPending[1]=true; lifeSignal(); }
@@ -387,6 +434,14 @@ void setup() {
   zbWdEnable.setManufacturerAndModel("ESP32-PLC", "WD-Enable");     zbWdEnable.onLightChange(onWdEnableChange);   Zigbee.addEndpoint(&zbWdEnable);
 
   // -- Zigbee stack --
+  // Zigbee2MQTT fa un bind (genOnOff) per ogni endpoint. La tabella di binding
+  // della scheda ha 16 posti di default: con 17 endpoint il 17esimo bind fallisce
+  // con TABLE_FULL e il dispositivo resta configurato a meta'.
+  // Va chiamata PRIMA di Zigbee.begin() (che esegue esp_zb_init).
+  // Se non compila o z2m continua a dare TABLE_FULL: togli questa riga e riduci
+  // il numero di endpoint a 16 o meno.
+  esp_zb_aps_src_binding_table_size_set(32);
+
   Serial.println("[INFO] Avvio Zigbee stack...");
   if (!Zigbee.begin(ZIGBEE_ROUTER)) {
     Serial.println("[ERROR] Zigbee.begin() fallito - reboot");
@@ -412,13 +467,23 @@ void setup() {
 // loop()
 // ---------------------------------------------------------------------------
 void loop() {
-  // 1. Scritture rele pendenti
+  // 1. Rele': applica subito le variazioni e riscrivi tutto ogni RELAY_REFRESH_MS
+  bool relayChanged = false;
   for (uint8_t i = 1; i <= 6; i++) {
     if (g_relayPending[i]) {
       g_relayPending[i] = false;
-      bool s = g_relayTarget[i];
-      writeRelay(i, s);
-      Serial.printf("[RELAY] %d -> %s\n", i, s ? "ON" : "OFF");
+      relayChanged = true;
+      Serial.printf("[RELAY] %d -> %s\n", i, g_relayTarget[i] ? "ON" : "OFF");
+    }
+  }
+  static uint32_t lastRelayRefresh = 0;
+  if (relayChanged || millis() - lastRelayRefresh >= RELAY_REFRESH_MS) {
+    lastRelayRefresh = millis();
+    if (applyRelayOutputs(!relayChanged)) {
+      g_i2cErrRun = 0;
+    } else {
+      g_i2cErrTotal++;
+      if (++g_i2cErrRun >= 3) { i2cRecover(); g_i2cErrRun = 0; }
     }
   }
 
@@ -487,5 +552,10 @@ void loop() {
     Serial.printf("[WD] armato=%d riavvii_reali=%d contatore=%u ultimo_segnale=%lus fa\n",
       g_armed, g_wdEnabled, (unsigned)g_restartCount,
       (unsigned long)((millis() - g_lastLifeMs) / 1000UL));
+    // diagnostica: rx = comandi Zigbee ricevuti, heap = memoria libera (se scende sempre: perdita)
+    Serial.printf("[SYS] uptime=%lus heap=%u minheap=%u rx=%lu i2cErr=%lu expReset=%lu\n",
+      (unsigned long)(millis() / 1000UL),
+      (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMinFreeHeap(),
+      (unsigned long)g_rxCount, (unsigned long)g_i2cErrTotal, (unsigned long)g_expResetTotal);
   }
 }
